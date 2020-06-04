@@ -1,12 +1,22 @@
 import { isWhitespace } from './str.js'
+import identity from './identity.js'
+
+// Distinguish a parser error from a normal runtime error
+class ParserError extends Error {
+	constructor (...args) {
+		super(...args)
+	}
+}
 
 class Parser{
-	parse(){
-		throw new Error("Abstract method cannot be invoked!");
+	parse(args, env){
+		// Should we just throw a ParserError here?
+		console.warn("Parser is undefined, generic parser being used.");
+		return args;
 	}
 
 	toString(){
-		throw new Error("Abstract method cannot be invoked!");
+		return 'The command prefers to keep its function a mystery.'
 	}
 }
 
@@ -71,38 +81,57 @@ class Parser{
  * @returns {Parser<?SimpleParserOutput>}
  */
 
+
+
 class SimpleArgumentParser extends Parser {
-	constructor(rawOptions){
+	static FAILURE = Symbol('Simple argument parser data failure')
+	static argTypes = {
+		keyword:/^(?<name>\w+)$/,
+		required:/^(?<class>\w*)<(?<name>\w+)>$/,
+		optional:/^(?<class>\w*)\[(?<name>\w+)\]$/
+	}
+	static builtInDataTypes = {
+		'': identity, //default (no class)
+		bool: value => {
+			let v=/^(?<t>t(?:rue)?|1|y(?:es)?)|(?:f(?:alse)?|0|no?)$/i.exec(value);
+			return v!==null?v.groups.t !== undefined:SimpleArgumentParser.FAILURE
+		},
+		int: value => parseInt(value)||SimpleArgumentParser.FAILURE,
+		float: value => parseFloat(value)||SimpleArgumentParser.FAILURE
+	}
+	constructor(rawOptions, dataTypes={}){
 		super();
 		this.rawOptions = rawOptions;
+		this.dataTypes = Object.assign(SimpleArgumentParser.builtInDataTypes, dataTypes);
 		this.options = Object.entries(rawOptions).map(([name, option]) => {
 			return {
 				name,
 				// Parse and validate the argument syntax
 				syntax: option.split(/\s+/).map(argument => {
-					let match
-					match = argument.match(/^(\w+)$/)
-					if (match) return { type: 'keyword', value: match[1] }
-					match = argument.match(/^<(\w+)>$/)
-					if (match) return { type: 'required', name: match[1] }
-					match = argument.match(/^\[(\w+)\]$/)
-					if (match) return { type: 'optional', name: match[1] }
-					throw new Error(`Invalid syntax: ${argument} is neither <required>, [optional], nor a keyword`)
+					// loop through all argTypes and try to match each
+					for (let [type, reg] of Object.entries(SimpleArgumentParser.argTypes)){
+						let match = reg.exec(argument);
+						if (match) return Object.assign({type:type}, match.groups);
+					}
+					throw new Error(`Invalid syntax: ${argument} is not a valid argument type`)
 				})
 			}
 		})
 	}
 
 	toString(){
-		return  Object.values(this.rawOptions);
+		return Object.entries(this.rawOptions).map(([name, raw]) => `${name}: \`${raw}\``).join('\n');
 	}
 
-	parse(unparsedArgs){
+	parse(unparsedArgs, env){
 		// Unnecessarily complicated; splits the unparsed arguments into an array
 		// of "words" (see the function description) or strings.
-		const tokens = [...unparsedArgs.matchAll(/"(?:[^"\\]|\\.)*"|\w+/g)]
+		const tokens = [...unparsedArgs.matchAll(/("(?:[^"\\]|\\.)*")|[^\s]+/g)]
 			// Parse strings using JSON.parse.
-			.map(match => match[0][0] === '"' ? JSON.parse(match[0]) : match[0])
+			.map(match => match[1] ? JSON.parse(match[1]) : match[0])
+
+		const invalidations = []
+
 		// Omg an obscure JavaScript label
 		mainLoop:
 		// Attempt to match the tokens using each possible parsing until there is
@@ -120,11 +149,13 @@ class SimpleArgumentParser extends Parser {
 			 */
 			for (let j = 0; j < syntax.length; j++) {
 				const argument = syntax[j]
+				console.log(argument);
 				// Are there insufficient tokens?
 				if (i >= tokens.length) {
 					// Maybe the rest of the arguments are optional. However, if not,
 					// then there isn't a match, so let's try the next possibility.
 					if (argument.type !== 'optional') {
+						invalidations.push(`${name}: Insufficient tokens.`)
 						continue mainLoop
 					}
 				}
@@ -135,16 +166,12 @@ class SimpleArgumentParser extends Parser {
 				switch (argument.type) {
 					case 'keyword':
 						// The current token should match the keyword exactly.
-						if (tokens[i] === argument.value) {
+						if (tokens[i] === argument.name) {
 							i++
 						} else {
+							invalidations.push(`${name}: Keyword "${argument.name}" did not match.`)
 							continue mainLoop
 						}
-						break
-					case 'required':
-						// Store the token as the argument value
-						data[argument.name] = tokens[i]
-						i++
 						break
 					case 'optional':
 						// This is so complicated because it's looking ahead to check to
@@ -157,13 +184,25 @@ class SimpleArgumentParser extends Parser {
 						// Billy" should not be considered invalid just because "to" is
 						// considered as the target, thus making "Billy" not match the
 						// keyword "to".
-						if (!(syntax[j + 1] && syntax[j + 1].type === 'keyword' &&
-							syntax[j + 1].value !== tokens[i + 1] && syntax[j + 1].value === tokens[i])) {
-							// Store the token as the argument value
-							data[argument.name] = tokens[i]
-							i++
+						if (syntax[j + 1] && syntax[j + 1].type === 'keyword' &&
+							syntax[j + 1].name !== tokens[i + 1] && syntax[j + 1].name === tokens[i]) {
+							// Do not store
+							break;
 						}
-						break
+						// If it continues, move down to required
+					case 'required':
+						// Store the token as the argument value
+						data[argument.name] = this.dataTypes[argument.class](tokens[i]);
+						if (data[argument.name]===SimpleArgumentParser.FAILURE) {
+							if (argument.type === 'required') {
+								invalidations.push(`${name}: Argument \`${argument.name}\` had value \`${tokens[i]}\`, which was not of type \`${argument.class}\`.`)
+								continue mainLoop
+							} else {
+								delete data[argument.name]
+							}
+						}
+						i++;
+						break;
 				}
 			}
 			// If there are extra tokens, then that shouldn't be considered a match.
@@ -172,7 +211,7 @@ class SimpleArgumentParser extends Parser {
 			return data
 		}
 		// The tokens didn't match any of the possible parsings, so it failed.
-		return null
+		throw new ParserError(invalidations.join('\n'))
 	}
 }
 
@@ -271,13 +310,15 @@ class BashlikeArgumentParser extends Parser{
 		isString: value => typeof value === 'string'
 	}
 
-	constructor(optionTypes=null){
+	constructor(optionTypes=null, description=''){
 		super();
 		this.optionTypes= optionTypes;
+		this.description = description
 		this.expectsNextValue = this.optionTypes === 'expect-all' ? null : new Set()
 		if (Array.isArray(this.optionTypes)) {
 			for (const optionType of this.optionTypes) {
-				const { name, aliases = [], validate, transform, aliasesOnly = false } = optionType
+				if (!optionType.aliases) optionType.aliases = []
+				const { name, aliases, validate, transform, aliasesOnly = false } = optionType
 				if (validate) {
 					if (!aliasesOnly) {
 						// `unshift` puts the name as the first item so that when it later
@@ -307,10 +348,15 @@ class BashlikeArgumentParser extends Parser{
 						throw new Error(`Invalid validate function for "${name}".`)
 					}
 				}
+				if (aliases.includes('...')) {
+					this._baseOption = name
+				} else if (aliases.includes('--')) {
+					this._restOption = name
+				}
 			}
 		}
 	}
-	
+
 	/**
 	 * A helper function for an argument parser inspired by the style of Bash
 	 * commands. Arguments, also known as options, are denoted using a hyphen for
@@ -477,11 +523,11 @@ class BashlikeArgumentParser extends Parser{
 				// apple -banana --car danny "elephant" ferry -- garry
 				// ^^^^^               ^^^^^            ^^^^^
 				if (char === '-') {
-					if (currentToken) throw new SyntaxError(`Required space before option (was parsing "${currentToken}").`)
-					if (expectValueNext) throw new SyntaxError(`Option "${expectValueNext}" expects a value.`)
+					if (currentToken) throw new ParserError(`Required space before option (was parsing "${currentToken}").`)
+					if (expectValueNext) throw new ParserError(`Option "${expectValueNext}" expects a value.`)
 					optionType = 'single'
 				} else if (char === '"' || char === '\'' || char === '`') {
-					if (currentToken) throw new SyntaxError(`Required space before string (was parsing "${currentToken}").`)
+					if (currentToken) throw new ParserError(`Required space before string (was parsing "${currentToken}").`)
 					inString = char
 				} else if (isWhitespace(char)) {
 					if (currentToken) {
@@ -509,7 +555,7 @@ class BashlikeArgumentParser extends Parser{
 				if (char === '-') {
 					// If there's another hyphen after the first hyphen, it's probably for
 					// a double hyphen option (eg "--cat").
-					if (expectValueNext) throw new SyntaxError(`Option "${expectValueNext}" expects a value.`)
+					if (expectValueNext) throw new ParserError(`Option "${expectValueNext}" expects a value.`)
 					// A side effect of this is that you can do '-wow-eee', which is the
 					// same as "-w -o -w --ee"e. Not ideal but I think it's fine.
 					optionType = 'double'
@@ -519,7 +565,7 @@ class BashlikeArgumentParser extends Parser{
 				} else if (expectValueNext) {
 					// If some previous option in the group expects a value but there's
 					// still another option anyways, then that is a PROBLEM.
-					throw new SyntaxError(`Option "${expectValueNext}" expects a value.`)
+					throw new ParserError(`Option "${expectValueNext}" expects a value.`)
 				} else if (!haveArgs || haveArgs.has(char)) {
 					// Note whether the option expects a value next.
 					expectValueNext = char
@@ -562,11 +608,11 @@ class BashlikeArgumentParser extends Parser{
 			} else {
 				// This shouldn't ever happen, but just in case, I guess.
 				console.error('Invalid state...?', { raw, options, optionType, inString, currentToken, char })
-				throw new Error('Invalid state...?')
+				throw new ParserError('Invalid state...?')
 			}
 		}
 		if (inString) {
-			throw new SyntaxError('String was not properly closed.')
+			throw new ParserError('String was not properly closed.')
 		}
 		// The `currentToken` won't get stored in `options` until it finds whitespace,
 		// but since we've reached the end of the string, there's no more whitespace
@@ -588,17 +634,17 @@ class BashlikeArgumentParser extends Parser{
 			}
 		}
 		if (expectValueNext && optionType !== 'rest') {
-			throw new SyntaxError(`Option "${expectValueNext}" expects a value.`)
+			throw new ParserError(`Option "${expectValueNext}" expects a value.`)
 		}
 		return options
 	}
-	parse(unparsedArgs, data){
-    const options = this._parseBashlike(unparsedArgs, this.expectsNextValue, data)
+	parse(unparsedArgs, env){
+    const options = this._parseBashlike(unparsedArgs, this.expectsNextValue, env)
     if (!Array.isArray(this.optionTypes)) return options
     const validatedOptions = {}
     for (const {
       name,
-      aliases = [],
+      aliases,
       validate,
       transform,
       optional = false,
@@ -618,20 +664,52 @@ class BashlikeArgumentParser extends Parser{
         } else if (optional) {
           continue
 				} else {
-					throw new Error(`Missing option "${name}".`)
+					throw new ParserError(`Missing option "${name}".`)
 				}
 			}
-			if (validate(value, data)) {
-				validatedOptions[name] = transform ? transform(value, data) : value
+			if (validate(value, env)) {
+				validatedOptions[name] = transform ? transform(value, env) : value
 			} else if (!optional) {
-				throw new Error(`Option "${name}" did not pass validation.`)
+				throw new ParserError(`Option "${name}" did not pass validation.`)
 			}
 		}
 		return validatedOptions
 	}
+
+	toString () {
+		if (!Array.isArray(this.optionTypes)) {
+			return this.description || 'This command accepts any options and values.'
+		}
+		const options = this.optionTypes
+			.map(({ name, aliases, optional, description, _presence }) => {
+				aliases = aliases
+					.filter(alias => alias !== '...' && alias !== '--')
+					.map(alias => alias.length === 1 ? `\`-${alias}\`` : `\`--${alias}\``)
+				return '`' + name.toUpperCase() + '`' +
+					(aliases.length ? ': ' + aliases.join(', ') : aliases) +
+					(_presence ? '' : ' <value>') +
+					(optional ? ' (optional)' : '') +
+					(description ? '\n\t' + description : '')
+			})
+			.filter(identity)
+			.join('\n')
+		return `Usage: \`${
+			[
+				options ? '[OPTIONS...]' : '',
+				this._baseOption ? `<${this._baseOption.toUpperCase()}...>` : '',
+				this._restOption ? `-- <${this._restOption.toUpperCase()}>` : ''
+			].filter(identity).join(' ')
+		}\`${
+			this.description ? '\n\n' + this.description : ''
+		}${
+			options ? '\n\n' + options : ''
+		}`
+	}
 }
 
 export {
+	ParserError,
+	Parser,
 	SimpleArgumentParser,
 	BashlikeArgumentParser
 }

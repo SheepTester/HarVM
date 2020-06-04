@@ -1,6 +1,6 @@
 import * as commands from './commands.js'
 import DataManager from './utils/data_manager.js'
-import * as storage from './utils/storage.js'
+import {Parser, ParserError} from './utils/parsers.js'
 
 export default async function main (token, Discord) {
 	const { Client } = Discord
@@ -8,22 +8,18 @@ export default async function main (token, Discord) {
 	// Create an instance of a Discord client
 	const client = new Client()
 
-	await storage.ready
-	client.prefix = await storage.getItem('[HarVM] prefix')
-	client.data = new DataManager(JSON.parse(await storage.getItem('[HarVM] data'))||{})
+	client.data = await dataManager();
+	client.commands = Object.keys(commands)
 
-	const aliases = new Map(JSON.parse(await storage.getItem('[HarVM] aliases')) || [])
+	const aliases = new Map(client.data.get({args:['aliases'],def:[]}))
 	const aliasUtil = {
 		aliases,
 		saveAliases () {
-			return storage.setItem('[HarVM] aliases', JSON.stringify([...aliases]))
+			return client.data.aliases = [...aliases];
 		}
 	}
 
 	client.on('ready', () => {
-		if (typeof client.prefix !== 'string') {
-			client.prefix = new RegExp(`^<@!?${client.user.id}>`)
-		}
 		console.log('ready')
 	})
 
@@ -78,14 +74,20 @@ export default async function main (token, Discord) {
 			return await runCommand(aliases.get(commandName) + command.slice(commandName.length), context)
 		} else {
 			return {
-				message: `Unknown command \`${command}\`.`,
+				message: `Unknown command \`${commandName}\`. Do \`help commands\` for a list of commands.`,
 				trace: context.trace
 			}
 		}
-		// Commands can return a string for an error message I guess
-		return await commandFn({
+		let parser
+		const bridge = {
+			Discord,
 			client,
 			unparsedArgs,
+			//Parse args using the parser for the given command; return undefined if no parser exists
+			get args() {
+				if (!parser) parser = commandFn.parser||new Parser()
+				return parser.parse(unparsedArgs, context.env)
+			},
 			msg,
 			env: context.env,
 			reply: (...args) => reply(msg, ...args),
@@ -97,18 +99,34 @@ export default async function main (token, Discord) {
 				const { trace, ...otherContext } = context
 				return runCommand(command, { trace: [...trace], ...otherContext })
 			}
-		})
+		}
+		try {
+			// Commands should return { message, trace } for an error message
+			return await commandFn(bridge)
+		} catch (err) {
+			if (err instanceof ParserError) {
+				return {
+					message: `There was a problem parsing the arguments for the command:\n${
+						err.message
+					}\n\nTo use the command, refer to its syntax:\n${
+						parser.toString()
+					}`,
+					trace: context.trace
+				}
+			} else {
+				const id = Math.random().toString(36).slice(2)
+				console.log(id, err)
+				return { message: err.message, runtime: true, id, trace: context.trace }
+			}
+		}
 	}
 
 	function removePrefix (message) {
-		const prefix = client.prefix
-		if (typeof prefix === 'string') {
-			if (message.startsWith(prefix)) return message.slice(prefix.length)
-		} else if (prefix instanceof RegExp) {
-			const match = message.match(prefix)
-			if (match) {
-				return message.slice(match[0].length)
-			}
+		const prefix = client.data.get({args:['prefix']})
+		if (message.startsWith(prefix)) return message.slice(prefix.length)
+		const match = message.match(new RegExp(`^<@!?${client.user.id}>`))
+		if (match) {
+			return message.slice(match[0].length)
 		}
 		return null
 	}
@@ -142,7 +160,11 @@ export default async function main (token, Discord) {
 					if (typeof error === 'string') {
 						reply(msg, error)
 					} else if (error.runtime) {
-						reply(msg, `A JavaScript runtime error occurred (id ${error.id}):\n${error.message}`)
+						if (error.trace) {
+							reply(msg, `A JavaScript runtime error occurred (id ${error.id}):\n${error.message}\n\n**Trace**\n${error.trace.join('\n') || '[Top level]'}`)
+						} else {
+							reply(msg, `A JavaScript runtime error occurred (id ${error.id}):\n${error.message}`)
+						}
 					} else if (error.trace) {
 						reply(msg, `A problem occurred:\n${error.message}\n\n**Trace**\n${error.trace.join('\n') || '[Top level]'}`)
 					}
